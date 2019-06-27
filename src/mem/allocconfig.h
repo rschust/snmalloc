@@ -4,11 +4,11 @@
 
 namespace snmalloc
 {
-  enum ZeroMem
-  {
-    NoZero,
-    YesZero
-  };
+// The CHECK_CLIENT macro is used to turn on minimal checking of the client
+// calling the API correctly.
+#if !defined(NDEBUG) && !defined(CHECK_CLIENT)
+#  define CHECK_CLIENT
+#endif
 
   // 0 intermediate bits results in power of 2 small allocs. 1 intermediate
   // bit gives additional sizeclasses at the midpoint between each power of 2.
@@ -90,6 +90,8 @@ namespace snmalloc
     ;
 
   // The remaining values are derived, not configurable.
+  static constexpr size_t POINTER_BITS =
+    bits::next_pow2_bits_const(sizeof(uintptr_t));
 
   // Used to isolate values on cache lines to prevent false sharing.
   static constexpr size_t CACHELINE_SIZE = 64;
@@ -147,4 +149,4 @@ namespace snmalloc
     "SLAB_COUNT must be a power of 2");
   static_assert(
     SLAB_COUNT <= (UINT8_MAX + 1), "SLAB_COUNT must fit in a uint8_t");
-};
+} // namespace snmalloc

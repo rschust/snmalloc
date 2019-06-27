@@ -2,6 +2,7 @@
 #include "../snmalloc.h"
 
 #include <errno.h>
+#include <string.h>
 
 using namespace snmalloc;
 
@@ -89,7 +90,7 @@ extern "C"
     if (p != nullptr)
     {
       assert(p == Alloc::external_pointer<Start>(p));
-      sz = (std::min)(size, sz);
+      sz = bits::min(size, sz);
       memcpy(p, ptr, sz);
       SNMALLOC_NAME_MANGLE(free)(ptr);
     }
@@ -135,7 +136,7 @@ extern "C"
       return nullptr;
     }
 
-    size = (std::max)(size, alignment);
+    size = bits::max(size, alignment);
     uint8_t sc = size_to_sizeclass(size);
     if (sc >= NUM_SIZECLASSES)
     {
@@ -157,7 +158,7 @@ extern "C"
     void** memptr, size_t alignment, size_t size)
   {
     if (
-      ((alignment % sizeof(void*)) != 0) ||
+      ((alignment % sizeof(uintptr_t)) != 0) ||
       ((alignment & (alignment - 1)) != 0) || (alignment == 0))
     {
       return EINVAL;
@@ -205,6 +206,37 @@ extern "C"
     return ENOENT;
   }
 
+#ifdef SNMALLOC_EXPOSE_PAGEMAP
+  /**
+   * Export the pagemap.  The return value is a pointer to the pagemap
+   * structure.  The argument is used to return a pointer to a `PagemapConfig`
+   * structure describing the type of the pagemap.  Static methods on the
+   * concrete pagemap templates can then be used to safely cast the return from
+   * this function to the correct type.  This allows us to preserve some
+   * semblance of ABI safety via a pure C API.
+   */
+  SNMALLOC_EXPORT void* SNMALLOC_NAME_MANGLE(snmalloc_pagemap_global_get)(
+    PagemapConfig const** config)
+  {
+    if (config)
+    {
+      *config = &decltype(snmalloc::global_pagemap)::config;
+      assert(
+        decltype(snmalloc::global_pagemap)::cast_to_pagemap(
+          &snmalloc::global_pagemap, *config) == &snmalloc::global_pagemap);
+    }
+    return &snmalloc::global_pagemap;
+  }
+#endif
+
+#ifdef SNMALLOC_EXPOSE_RESERVE
+  SNMALLOC_EXPORT void*
+    SNMALLOC_NAME_MANGLE(snmalloc_reserve_shared)(size_t* size, size_t align)
+  {
+    return snmalloc::default_memory_provider.reserve<true>(size, align);
+  }
+#endif
+
 #if !defined(__PIC__) && !defined(NO_BOOTSTRAP_ALLOCATOR)
   // The following functions are required to work before TLS is set up, in
   // statically-linked programs.  These temporarily grab an allocator from the
@@ -222,7 +254,7 @@ extern "C"
     if (overflow)
     {
       errno = ENOMEM;
-      return 0;
+      return nullptr;
     }
     // Include size 0 in the first sizeclass.
     sz = ((sz - 1) >> (bits::BITS - 1)) + sz;

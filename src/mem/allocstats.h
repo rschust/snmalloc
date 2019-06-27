@@ -21,10 +21,12 @@ namespace snmalloc
     {
       size_t current = 0;
       size_t max = 0;
+      size_t used = 0;
 
       void inc()
       {
         current++;
+        used++;
         if (current > max)
           max++;
       }
@@ -48,11 +50,12 @@ namespace snmalloc
       {
         current += that.current;
         max += that.max;
+        used += that.used;
       }
 #ifdef USE_SNMALLOC_STATS
       void print(CSVStream& csv, size_t multiplier = 1)
       {
-        csv << current * multiplier << max * multiplier;
+        csv << current * multiplier << max * multiplier << used * multiplier;
       }
 #endif
     };
@@ -82,7 +85,8 @@ namespace snmalloc
 
         if (slab_count.current != 0)
         {
-          double occupancy = (double)count.current / (double)slab_count.current;
+          double occupancy = static_cast<double>(count.current) /
+            static_cast<double>(slab_count.current);
           uint64_t duration = now - time;
 
           if (ticks == 0)
@@ -103,7 +107,7 @@ namespace snmalloc
         // Keep in sync with header lower down
         count.print(csv, multiplier);
         slab_count.print(csv, slab_multiplier);
-        size_t average = (size_t)(online_average * multiplier);
+        size_t average = static_cast<size_t>(online_average * multiplier);
 
         csv << average << (slab_multiplier - average) * slab_count.max
             << csv.endl;
@@ -116,7 +120,7 @@ namespace snmalloc
     static constexpr size_t BUCKETS = 1 << BUCKETS_BITS;
     static constexpr size_t TOTAL_BUCKETS =
       bits::to_exp_mant_const<BUCKETS_BITS>(
-        ((size_t)1 << (bits::ADDRESS_BITS - 1)));
+        bits::one_at_bit(bits::ADDRESS_BITS - 1));
 
     Stats sizeclass[N];
     Stats large[LARGE_N];
@@ -326,10 +330,12 @@ namespace snmalloc
             << "AllocatorID"
             << "Size group"
             << "Size"
-            << "Current bytes"
-            << "Max bytes"
+            << "Current count"
+            << "Max count"
+            << "Total Allocs"
             << "Current Slab bytes"
             << "Max Slab bytes"
+            << "Total slab allocs"
             << "Average Slab Usage"
             << "Average wasted space" << csv.endl;
 
@@ -352,7 +358,7 @@ namespace snmalloc
         csv << "BucketedStats" << dumpid << allocatorid << i
             << sizeclass_to_size(i);
 
-        sizeclass[i].print(csv, sizeclass_to_size(i), SLAB_SIZE);
+        sizeclass[i].print(csv, sizeclass_to_size(i));
       }
 
       for (uint8_t i = 0; i < LARGE_N; i++)
@@ -388,4 +394,4 @@ namespace snmalloc
     }
 #endif
   };
-}
+} // namespace snmalloc

@@ -10,6 +10,10 @@ snmalloc is a research allocator.  Its key design features are:
 * The allocator uses large ranges of pages to reduce the amount of meta-data
   required.
 
+Details about snmalloc's design can be found in the
+[accompanying paper](snmalloc.pdf). Differences between the paper and the
+current implementation are [described here](difference.md).
+
 [![Build Status](https://dev.azure.com/snmalloc/snmalloc/_apis/build/status/Microsoft.snmalloc?branchName=master)](https://dev.azure.com/snmalloc/snmalloc/_build/latest?definitionId=1?branchName=master)
 
 # Building on Windows
@@ -36,8 +40,10 @@ using the Visual Studio compiler.
 # Building on macOS, Linux or FreeBSD
 Snmalloc has very few dependencies, CMake, Ninja, Clang 6.0 or later and a C++17
 standard library.
-Building with GCC is currently not supported because GCC lacks support for the
-`selectany` attribute to specify variables in a COMDAT.
+Building with GCC is currently not recommended because GCC lacks support for the
+`selectany` attribute to specify variables in a COMDAT.  
+It will, however, build with GCC-7, but some of global variables will be 
+preemptible.
 
 To build a debug configuration:
 ```
@@ -78,6 +84,28 @@ These can be added to your cmake command line.
 ```
 -DUSE_SNMALLOC_STATS=ON // Track allocation stats
 -DUSE_MEASURE=ON // Measure performance with histograms
+```
+
+# Using snmalloc as header-only library
+
+In this section we show how to compile snmalloc into your project such that it replaces the standard allocator functions such as free and malloc. The following instructions were tested with CMake and Clang running on Ubuntu 18.04.
+
+Add these lines to your CMake file.
+```
+set(SNMALLOC_ONLY_HEADER_LIBRARY ON)
+add_subdirectory(snmalloc EXCLUDE_FROM_ALL)
+```
+
+In addition make sure your executable is compiled to support 128 bit atomic operations. This may require you to add the following to your CMake file.
+```
+target_link_libraries([lib_name] PRIVATE snmalloc_lib)
+```
+
+You will also need to compile the relavent parts of snmalloc itself. Create a new file with the following contents and compile it with the rest of your application.
+```
+#define NO_BOOTSTRAP_ALLOCATOR
+
+#include "snmalloc/src/override/malloc.cc"
 ```
 
 # Contributing

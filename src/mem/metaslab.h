@@ -15,18 +15,15 @@ namespace snmalloc
 
     Slab* get_slab()
     {
-      return (Slab*)((size_t)this & SLAB_MASK);
+      return pointer_cast<Slab>(address_cast(this) & SLAB_MASK);
     }
   };
 
-  using SlabList = DLList<SlabLink, ~(uintptr_t)0>;
+  using SlabList = DLList<SlabLink>;
 
   static_assert(
     sizeof(SlabLink) <= MIN_ALLOC_SIZE,
     "Need to be able to pack a SlabLink into any free small alloc");
-
-  static constexpr uint16_t SLABLINK_INDEX =
-    (uint16_t)(SLAB_SIZE - sizeof(SlabLink));
 
   // The Metaslab represent the status of a single slab.
   // This can be either a short or a standard slab.
@@ -42,16 +39,11 @@ namespace snmalloc
     // of where we have allocated up to in this slab. Otherwise,
     // it represents the location of the first block in the free
     // list.  The free list is chained through deallocated blocks.
-    // It either terminates with a bump ptr, or if all the space is in
-    // the free list, then the last block will be also referenced by
-    // link.
-    // Note that, in the case that this is the first block in the size
-    // class list, where all the unused memory is in the free list,
-    // then the last block can both be interpreted as a final bump
-    // pointer entry, and the first entry in the doubly linked list.
-    // The terminal value in the free list, and the terminal value in
-    // the SlabLink previous field will alias. The SlabLink uses ~0 for
-    // its terminal value to be a valid terminal bump ptr.
+    // It is terminated with a bump ptr.
+    //
+    // Note that, the first entry in a slab is never bump allocated
+    // but is used for the link. This means that 1 represents the fully
+    // bump allocated slab.
     Mod<SLAB_SIZE, uint16_t> head;
     // When a slab has free space it will be on the has space list for
     // that size class.  We use an empty block in this slab to be the
@@ -84,37 +76,99 @@ namespace snmalloc
 
     bool is_full()
     {
-      return (head & 2) != 0;
+      return link == 1;
     }
 
     void set_full()
     {
       assert(head == 1);
-      head = (uint16_t)~0;
+      assert(link != 1);
+      link = 1;
     }
 
     SlabLink* get_link(Slab* slab)
     {
-      return (SlabLink*)((size_t)slab + link);
+      return reinterpret_cast<SlabLink*>(pointer_offset(slab, link));
     }
 
+    /// Value used to check for corruptions in a block
+    static constexpr size_t POISON =
+      static_cast<size_t>(bits::is64() ? 0xDEADBEEFDEAD0000 : 0xDEAD0000);
+
+    /// Store next pointer in a block. In Debug using magic value to detect some
+    /// simple corruptions.
+    static void store_next(void* p, uint16_t head)
+    {
+#ifndef CHECK_CLIENT
+      *static_cast<size_t*>(p) = head;
+#else
+      *static_cast<size_t*>(p) =
+        head ^ POISON ^ (static_cast<size_t>(head) << (bits::BITS - 16));
+#endif
+    }
+
+    /// Accessor function for the next pointer in a block.
+    /// In Debug checks for simple corruptions.
+    static uint16_t follow_next(void* node)
+    {
+      size_t next = *static_cast<size_t*>(node);
+#ifdef CHECK_CLIENT
+      if (((next ^ POISON) ^ (next << (bits::BITS - 16))) > 0xFFFF)
+        error("Detected memory corruption.  Use-after-free.");
+#endif
+      return static_cast<uint16_t>(next);
+    }
     bool valid_head(bool is_short)
     {
       size_t size = sizeclass_to_size(sizeclass);
-      size_t offset = get_slab_offset(sizeclass, is_short);
+      size_t slab_start = get_initial_link(sizeclass, is_short);
+      size_t all_high_bits = ~static_cast<size_t>(1);
 
       size_t head_start =
-        remove_cache_friendly_offset(head & ~(size_t)1, sizeclass);
-      size_t slab_start = offset & ~(size_t)1;
+        remove_cache_friendly_offset(head & all_high_bits, sizeclass);
 
       return ((head_start - slab_start) % size) == 0;
+    }
+
+    /**
+     * Check bump-free-list-segment for cycles
+     *
+     * Using
+     * https://en.wikipedia.org/wiki/Cycle_detection#Floyd's_Tortoise_and_Hare
+     * We don't expect a cycle, so worst case is only followed by a crash, so
+     * slow doesn't mater.
+     **/
+    void debug_slab_acyclic_free_list(Slab* slab)
+    {
+#ifndef NDEBUG
+      uint16_t curr = head;
+      uint16_t curr_slow = head;
+      bool both = false;
+      while ((curr & 1) != 1)
+      {
+        curr = follow_next(pointer_offset(slab, curr));
+        if (both)
+        {
+          curr_slow = follow_next(pointer_offset(slab, curr_slow));
+        }
+
+        if (curr == curr_slow)
+        {
+          error("Free list contains a cycle, typically indicates double free.");
+        }
+
+        both = !both;
+      }
+#else
+      UNUSED(slab);
+#endif
     }
 
     void debug_slab_invariant(bool is_short, Slab* slab)
     {
 #if !defined(NDEBUG) && !defined(SNMALLOC_CHEAP_CHECKS)
       size_t size = sizeclass_to_size(sizeclass);
-      size_t offset = get_slab_offset(sizeclass, is_short) - 1;
+      size_t offset = get_initial_link(sizeclass, is_short);
 
       size_t accounted_for = used * size + offset;
 
@@ -126,8 +180,11 @@ namespace snmalloc
         // 'link' value is not important if full.
         return;
       }
+
       // Block is not full
       assert(SLAB_SIZE > accounted_for);
+
+      debug_slab_acyclic_free_list(slab);
 
       // Walk bump-free-list-segment accounting for unused space
       uint16_t curr = head;
@@ -140,27 +197,30 @@ namespace snmalloc
         // Account for free elements in free list
         accounted_for += size;
         assert(SLAB_SIZE >= accounted_for);
-        // We are not guaranteed to hit a bump ptr unless
-        // we are the top element on the size class, so treat as
-        // a list segment.
-        if (curr == link)
-          break;
+        // We should never reach the link node in the free list.
+        assert(curr != link);
+
         // Iterate bump/free list segment
-        curr = *(uint16_t*)((uintptr_t)slab + curr);
+        curr = follow_next(pointer_offset(slab, curr));
       }
 
-      // Check we terminated traversal on a correctly aligned block
-      uint16_t start = remove_cache_friendly_offset(curr & ~1, sizeclass);
-      assert((start - offset) % size == 0);
-
-      if (curr != link)
+      if (curr != 1)
       {
-        // The link should be at the special end location as we
-        // haven't completely filled this block at any point.
-        assert(link == SLABLINK_INDEX);
+        // Check we terminated traversal on a correctly aligned block
+        uint16_t start = remove_cache_friendly_offset(curr & ~1, sizeclass);
+        assert((start - offset) % size == 0);
+
         // Account for to be bump allocated space
         accounted_for += SLAB_SIZE - (curr - 1);
+
+        // The link should be the first allocation as we
+        // haven't completely filled this block at any point.
+        assert(link == get_initial_link(sizeclass, is_short));
       }
+
+      assert(!is_full());
+      // Add the link node.
+      accounted_for += size;
 
       // All space accounted for
       assert(SLAB_SIZE == accounted_for);
@@ -170,4 +230,4 @@ namespace snmalloc
 #endif
     }
   };
-}
+} // namespace snmalloc

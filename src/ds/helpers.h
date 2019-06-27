@@ -13,11 +13,19 @@ namespace snmalloc
   class Singleton
   {
   public:
-    inline static Object& get()
+    /**
+     * If argument is non-null, then it is assigned the value
+     * true, if this is the first call to get.
+     * At most one call will be first.
+     */
+    inline static Object& get(bool* first = nullptr)
     {
       static std::atomic_flag flag;
       static std::atomic<bool> initialised;
       static Object obj;
+
+      // If defined should be initially false;
+      assert(first == nullptr || *first == false);
 
       if (!initialised.load(std::memory_order_acquire))
       {
@@ -26,6 +34,8 @@ namespace snmalloc
         {
           obj = init();
           initialised.store(true, std::memory_order_release);
+          if (first != nullptr)
+            *first = true;
         }
       }
       return obj;
@@ -50,13 +60,13 @@ namespace snmalloc
   public:
     operator T()
     {
-      return (T)(value & (length - 1));
+      return static_cast<T>(value & (length - 1));
     }
 
-    T& operator=(const T v)
+    Mod& operator=(const T v)
     {
       value = v;
-      return value;
+      return *this;
     }
   };
 
@@ -77,4 +87,4 @@ namespace snmalloc
       return array[i & (rlength - 1)];
     }
   };
-}
+} // namespace snmalloc

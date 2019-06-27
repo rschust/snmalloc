@@ -1,9 +1,7 @@
 #pragma once
 
 #include "bits.h"
-
-#include <stdlib.h>
-#include <utility>
+#include "helpers.h"
 
 namespace snmalloc
 {
@@ -12,7 +10,7 @@ namespace snmalloc
   {
   private:
     static_assert(
-      std::is_same<decltype(((T*)0)->next), std::atomic<T*>>::value,
+      std::is_same<decltype(T::next), std::atomic<T*>>::value,
       "T->next must be a std::atomic<T*>");
 
     std::atomic<T*> back;
@@ -81,4 +79,4 @@ namespace snmalloc
       return nullptr;
     }
   };
-}
+} // namespace snmalloc

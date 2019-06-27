@@ -21,8 +21,6 @@
 #include "sizeclasstable.h"
 #include "slab.h"
 
-#include <array>
-
 namespace snmalloc
 {
   enum Boundary
@@ -62,35 +60,106 @@ namespace snmalloc
     Pagemap<SUPERSLAB_BITS, uint8_t, 0>>;
 
   HEADER_GLOBAL SuperslabPagemap global_pagemap;
+
+  /**
+   * Mixin used by `SuperslabMap` to directly access the pagemap via a global
+   * variable.  This should be used from within the library or program that
+   * owns the pagemap.
+   */
+  struct GlobalPagemap
+  {
+    /**
+     * Returns the pagemap.
+     */
+    SuperslabPagemap& pagemap()
+    {
+      return global_pagemap;
+    }
+  };
+
+  /**
+   * Optionally exported function that accesses the global pagemap provided by
+   * a shared library.
+   */
+  extern "C" void* snmalloc_pagemap_global_get(snmalloc::PagemapConfig const**);
+
+  /**
+   * Mixin used by `SuperslabMap` to access the global pagemap via a
+   * type-checked C interface.  This should be used when another library (e.g.
+   * your C standard library) uses snmalloc and you wish to use a different
+   * configuration in your program or library, but wish to share a pagemap so
+   * that either version can deallocate memory.
+   */
+  class ExternalGlobalPagemap
+  {
+    /**
+     * A pointer to the pagemap.
+     */
+    SuperslabPagemap* external_pagemap;
+
+  public:
+    /**
+     * Constructor.  Accesses the pagemap via the C ABI accessor and casts it to
+     * the expected type, failing in cases of ABI mismatch.
+     */
+    ExternalGlobalPagemap()
+    {
+      const snmalloc::PagemapConfig* c;
+      external_pagemap =
+        SuperslabPagemap::cast_to_pagemap(snmalloc_pagemap_global_get(&c), c);
+      // FIXME: Report an error somehow in non-debug builds.
+      assert(external_pagemap);
+    }
+
+    /**
+     * Returns the exported pagemap.
+     */
+    SuperslabPagemap& pagemap()
+    {
+      return *external_pagemap;
+    }
+  };
+
   /**
    * Class that defines an interface to the pagemap.  This is provided to
    * `Allocator` as a template argument and so can be replaced by a compatible
    * implementation (for example, to move pagemap updates to a different
    * protection domain).
    */
-  struct SuperslabMap
+  template<typename PagemapProvider = GlobalPagemap>
+  struct SuperslabMap : public PagemapProvider
   {
+    using PagemapProvider::PagemapProvider;
+    /**
+     * Get the pagemap entry corresponding to a specific address.
+     */
+    uint8_t get(address_t p)
+    {
+      return PagemapProvider::pagemap().get(p);
+    }
+
     /**
      * Get the pagemap entry corresponding to a specific address.
      */
     uint8_t get(void* p)
     {
-      return global_pagemap.get(p);
+      return get(address_cast(p));
     }
+
     /**
      * Set a pagemap entry indicating that there is a superslab at the
      * specified index.
      */
     void set_slab(Superslab* slab)
     {
-      set(slab, (size_t)PMSuperslab);
+      set(slab, static_cast<size_t>(PMSuperslab));
     }
     /**
      * Add a pagemap entry indicating that a medium slab has been allocated.
      */
     void set_slab(Mediumslab* slab)
     {
-      set(slab, (size_t)PMMediumslab);
+      set(slab, static_cast<size_t>(PMMediumslab));
     }
     /**
      * Remove an entry from the pagemap corresponding to a superslab.
@@ -98,7 +167,7 @@ namespace snmalloc
     void clear_slab(Superslab* slab)
     {
       assert(get(slab) == PMSuperslab);
-      set(slab, (size_t)PMNotOurs);
+      set(slab, static_cast<size_t>(PMNotOurs));
     }
     /**
      * Remove an entry corresponding to a medium slab.
@@ -106,7 +175,7 @@ namespace snmalloc
     void clear_slab(Mediumslab* slab)
     {
       assert(get(slab) == PMMediumslab);
-      set(slab, (size_t)PMNotOurs);
+      set(slab, static_cast<size_t>(PMNotOurs));
     }
     /**
      * Update the pagemap to reflect a large allocation, of `size` bytes from
@@ -115,28 +184,30 @@ namespace snmalloc
     void set_large_size(void* p, size_t size)
     {
       size_t size_bits = bits::next_pow2_bits(size);
-      set(p, (uint8_t)size_bits);
+      set(p, static_cast<uint8_t>(size_bits));
       // Set redirect slide
-      uintptr_t ss = (uintptr_t)((size_t)p + SUPERSLAB_SIZE);
+      auto ss = address_cast(p) + SUPERSLAB_SIZE;
       for (size_t i = 0; i < size_bits - SUPERSLAB_BITS; i++)
       {
         size_t run = 1ULL << i;
-        global_pagemap.set_range(
-          (void*)ss, (uint8_t)(64 + i + SUPERSLAB_BITS), run);
-        ss = (uintptr_t)ss + SUPERSLAB_SIZE * run;
+        PagemapProvider::pagemap().set_range(
+          ss, static_cast<uint8_t>(64 + i + SUPERSLAB_BITS), run);
+        ss = ss + SUPERSLAB_SIZE * run;
       }
-      global_pagemap.set(p, (uint8_t)size_bits);
+      PagemapProvider::pagemap().set(
+        address_cast(p), static_cast<uint8_t>(size_bits));
     }
     /**
      * Update the pagemap to remove a large allocation, of `size` bytes from
      * address `p`.
      */
-    void clear_large_size(void* p, size_t size)
+    void clear_large_size(void* vp, size_t size)
     {
+      auto p = address_cast(vp);
       size_t rounded_size = bits::next_pow2(size);
       assert(get(p) == bits::next_pow2_bits(size));
       auto count = rounded_size >> SUPERSLAB_BITS;
-      global_pagemap.set_range((void*)p, PMNotOurs, count);
+      PagemapProvider::pagemap().set_range(p, PMNotOurs, count);
     }
 
   private:
@@ -147,12 +218,12 @@ namespace snmalloc
      */
     void set(void* p, uint8_t x)
     {
-      global_pagemap.set(p, x);
+      PagemapProvider::pagemap().set(address_cast(p), x);
     }
   };
 
 #ifndef SNMALLOC_DEFAULT_PAGEMAP
-#  define SNMALLOC_DEFAULT_PAGEMAP snmalloc::SuperslabMap
+#  define SNMALLOC_DEFAULT_PAGEMAP snmalloc::SuperslabMap<>
 #endif
 
   /**
@@ -256,15 +327,14 @@ namespace snmalloc
         size_t rsize = sizeclass_to_size(sizeclass);
         return small_alloc<zero_mem, allow_reserve>(sizeclass, rsize);
       }
-      else if (sizeclass < NUM_SIZECLASSES)
+      if (sizeclass < NUM_SIZECLASSES)
       {
         size_t rsize = sizeclass_to_size(sizeclass);
         return medium_alloc<zero_mem, allow_reserve>(sizeclass, rsize, size);
       }
-      else
-      {
-        return large_alloc<zero_mem, allow_reserve>(size);
-      }
+
+      return large_alloc<zero_mem, allow_reserve>(size);
+
 #endif
     }
 
@@ -357,7 +427,7 @@ namespace snmalloc
 
       // Free memory of an unknown size. Must be called with an external
       // pointer.
-      uint8_t size = pagemap().get(p);
+      uint8_t size = pagemap().get(address_cast(p));
 
       if (size == 0)
       {
@@ -383,9 +453,9 @@ namespace snmalloc
           remote_dealloc(target, p, sizeclass);
         return;
       }
-      else if (size == PMMediumslab)
+      if (size == PMMediumslab)
       {
-        Mediumslab* slab = (Mediumslab*)super;
+        Mediumslab* slab = Mediumslab::get(p);
         RemoteAllocator* target = slab->get_allocator();
 
         // Reading a remote sizeclass won't fail, since the other allocator
@@ -399,8 +469,8 @@ namespace snmalloc
         return;
       }
 
-#  ifndef SNMALLOC_SAFE_CLIENT
-      if (size > 64 || (void*)super != p)
+#  ifdef CHECK_CLIENT
+      if (size > 64 || address_cast(super) != address_cast(p))
       {
         error("Not deallocating start of an object");
       }
@@ -410,13 +480,13 @@ namespace snmalloc
     }
 
     template<Boundary location = Start>
-    static void* external_pointer(void* p)
+    static address_t external_address(void* p)
     {
 #ifdef USE_MALLOC
       error("Unsupported");
       UNUSED(p);
 #else
-      uint8_t size = global_pagemap.get(p);
+      uint8_t size = global_pagemap.get(address_cast(p));
 
       Superslab* super = Superslab::get(p);
       if (size == PMSuperslab)
@@ -425,34 +495,35 @@ namespace snmalloc
         Metaslab& meta = super->get_meta(slab);
 
         uint8_t sc = meta.sizeclass;
-        size_t slab_end = (size_t)slab + SLAB_SIZE;
+        size_t slab_end = static_cast<size_t>(address_cast(slab) + SLAB_SIZE);
 
         return external_pointer<location>(p, sc, slab_end);
       }
-      else if (size == PMMediumslab)
+      if (size == PMMediumslab)
       {
-        Mediumslab* slab = (Mediumslab*)super;
+        Mediumslab* slab = Mediumslab::get(p);
 
         uint8_t sc = slab->get_sizeclass();
-        size_t slab_end = (size_t)slab + SUPERSLAB_SIZE;
+        size_t slab_end =
+          static_cast<size_t>(address_cast(slab) + SUPERSLAB_SIZE);
 
         return external_pointer<location>(p, sc, slab_end);
       }
 
-      uintptr_t ss = (uintptr_t)super;
+      auto ss = address_cast(super);
 
       while (size > 64)
       {
         // This is a large alloc redirect.
         ss = ss - (1ULL << (size - 64));
-        size = global_pagemap.get((void*)ss);
+        size = global_pagemap.get(ss);
       }
 
       if (size == 0)
       {
         if constexpr ((location == End) || (location == OnePastEnd))
           // We don't know the End, so return MAX_PTR
-          return (void*)-1;
+          return UINTPTR_MAX;
         else
           // We don't know the Start, so return MIN_PTR
           return 0;
@@ -460,18 +531,24 @@ namespace snmalloc
 
       // This is a large alloc, mask off to the slab size.
       if constexpr (location == Start)
-        return (void*)ss;
+        return ss;
       else if constexpr (location == End)
-        return (void*)((size_t)ss + (1ULL << size) - 1ULL);
+        return (ss + (1ULL << size) - 1ULL);
       else
-        return (void*)((size_t)ss + (1ULL << size));
+        return (ss + (1ULL << size));
 #endif
+    }
+
+    template<Boundary location = Start>
+    static void* external_pointer(void* p)
+    {
+      return pointer_cast<void>(external_address<location>(p));
     }
 
     static size_t alloc_size(void* p)
     {
       // This must be called on an external pointer.
-      size_t size = global_pagemap.get(p);
+      size_t size = global_pagemap.get(address_cast(p));
 
       if (size == 0)
       {
@@ -490,11 +567,9 @@ namespace snmalloc
       }
       else if (size == PMMediumslab)
       {
-        Superslab* super = Superslab::get(p);
+        Mediumslab* slab = Mediumslab::get(p);
         // Reading a remote sizeclass won't fail, since the other allocator
         // can't reuse the slab, as we have no yet deallocated this pointer.
-        Mediumslab* slab = (Mediumslab*)super;
-
         return sizeclass_to_size(slab->get_sizeclass());
       }
 
@@ -551,7 +626,7 @@ namespace snmalloc
       {
         this->size += sizeclass_to_size(sizeclass);
 
-        Remote* r = (Remote*)p;
+        Remote* r = static_cast<Remote*>(p);
         r->set_target_id(target_id);
         assert(r->target_id() == target_id);
 
@@ -688,7 +763,7 @@ namespace snmalloc
         remote_alloc = r;
       }
 
-      if (id() >= (alloc_id_t)-1)
+      if (id() >= static_cast<alloc_id_t>(-1))
         error("Id should not be -1");
 
       init_message_queue();
@@ -718,15 +793,17 @@ namespace snmalloc
     }
 
     template<Boundary location>
-    static void* external_pointer(void* p, uint8_t sizeclass, size_t end_point)
+    static uintptr_t
+    external_pointer(void* p, uint8_t sizeclass, size_t end_point)
     {
       size_t rsize = sizeclass_to_size(sizeclass);
       size_t end_point_correction = location == End ?
         (end_point - 1) :
         (location == OnePastEnd ? end_point : (end_point - rsize));
-      size_t offset_from_end = (end_point - 1) - (size_t)p;
+      size_t offset_from_end =
+        (end_point - 1) - static_cast<size_t>(address_cast(p));
       size_t end_to_end = round_by_sizeclass(rsize, offset_from_end);
-      return (void*)(end_point_correction - end_to_end);
+      return end_point_correction - end_to_end;
     }
 
     void init_message_queue()
@@ -740,6 +817,10 @@ namespace snmalloc
       {
         Superslab* super = Superslab::get(p);
 
+#ifdef CHECK_CLIENT
+        if (p->target_id() != super->get_allocator()->id())
+          error("Detected memory corruption.  Potential use-after-free");
+#endif
         if (super->get_kind() == Super)
         {
           Slab* slab = Slab::get(p);
@@ -792,10 +873,10 @@ namespace snmalloc
       remote.post(id());
     }
 
-    inline void handle_message_queue()
+    ALWAYSINLINE void handle_message_queue()
     {
       // Inline the empty check, but not necessarily the full queue handling.
-      if (message_queue().is_empty())
+      if (likely(message_queue().is_empty()))
         return;
 
       handle_message_queue_inner();
@@ -809,8 +890,9 @@ namespace snmalloc
       if (super != nullptr)
         return super;
 
-      super = (Superslab*)large_allocator.template alloc<NoZero, allow_reserve>(
-        0, SUPERSLAB_SIZE);
+      super = reinterpret_cast<Superslab*>(
+        large_allocator.template alloc<NoZero, allow_reserve>(
+          0, SUPERSLAB_SIZE));
 
       if ((allow_reserve == NoReserve) && (super == nullptr))
         return super;
@@ -909,11 +991,11 @@ namespace snmalloc
       stats().sizeclass_alloc(sizeclass);
 
       SlabList* sc = &small_classes[sizeclass];
-      SlabLink* link = sc->get_head();
       Slab* slab;
 
-      if (link != (SlabLink*)~0)
+      if (!sc->is_empty())
       {
+        SlabLink* link = sc->get_head();
         slab = link->get_slab();
       }
       else
@@ -931,7 +1013,7 @@ namespace snmalloc
 
     void small_dealloc(Superslab* super, void* p, uint8_t sizeclass)
     {
-#ifndef SNMALLOC_SAFE_CLIENT
+#ifdef CHECK_CLIENT
       Slab* slab = Slab::get(p);
       if (!slab->is_start_of_object(super, p))
       {
@@ -996,7 +1078,7 @@ namespace snmalloc
           if constexpr (decommit_strategy == DecommitSuper)
           {
             large_allocator.memory_provider.notify_not_using(
-              (void*)((size_t)super + OS_PAGE_SIZE),
+              pointer_offset(super, OS_PAGE_SIZE),
               SUPERSLAB_SIZE - OS_PAGE_SIZE);
           }
           else if constexpr (decommit_strategy == DecommitSuperLazy)
@@ -1043,9 +1125,9 @@ namespace snmalloc
       }
       else
       {
-        slab =
-          (Mediumslab*)large_allocator.template alloc<NoZero, allow_reserve>(
-            0, SUPERSLAB_SIZE);
+        slab = reinterpret_cast<Mediumslab*>(
+          large_allocator.template alloc<NoZero, allow_reserve>(
+            0, SUPERSLAB_SIZE));
 
         if ((allow_reserve == NoReserve) && (slab == nullptr))
           return nullptr;
@@ -1068,10 +1150,10 @@ namespace snmalloc
       stats().sizeclass_dealloc(sizeclass);
       bool was_full = slab->dealloc(p, large_allocator.memory_provider);
 
-#ifndef SNMALLOC_SAFE_CLIENT
+#ifdef CHECK_CLIENT
       if (!is_multiple_of_sizeclass(
             sizeclass_to_size(sizeclass),
-            (uintptr_t)slab + SUPERSLAB_SIZE - (uintptr_t)p))
+            address_cast(slab) + SUPERSLAB_SIZE - address_cast(p)))
       {
         error("Not deallocating start of an object");
       }
@@ -1089,8 +1171,7 @@ namespace snmalloc
         if constexpr (decommit_strategy == DecommitSuper)
         {
           large_allocator.memory_provider.notify_not_using(
-            (void*)((size_t)slab + OS_PAGE_SIZE),
-            SUPERSLAB_SIZE - OS_PAGE_SIZE);
+            pointer_offset(slab, OS_PAGE_SIZE), SUPERSLAB_SIZE - OS_PAGE_SIZE);
         }
 
         pagemap().clear_slab(slab);
@@ -1134,7 +1215,7 @@ namespace snmalloc
       MEASURE_TIME(large_dealloc, 4, 16);
 
       size_t size_bits = bits::next_pow2_bits(size);
-      size_t rsize = (size_t)1 << size_bits;
+      size_t rsize = bits::one_at_bit(size_bits);
       assert(rsize >= SUPERSLAB_SIZE);
       size_t large_class = size_bits - SUPERSLAB_BITS;
 
@@ -1144,10 +1225,10 @@ namespace snmalloc
 
       if ((decommit_strategy != DecommitNone) || (large_class > 0))
         large_allocator.memory_provider.notify_not_using(
-          (void*)((size_t)p + OS_PAGE_SIZE), rsize - OS_PAGE_SIZE);
+          pointer_offset(p, OS_PAGE_SIZE), rsize - OS_PAGE_SIZE);
 
       // Initialise in order to set the correct SlabKind.
-      Largeslab* slab = (Largeslab*)p;
+      Largeslab* slab = static_cast<Largeslab*>(p);
       slab->init();
       large_allocator.dealloc(slab, large_class);
     }
@@ -1173,4 +1254,4 @@ namespace snmalloc
       return page_map;
     }
   };
-}
+} // namespace snmalloc

@@ -7,6 +7,10 @@
 #error At most one out of SNMALLOC_USE_THREAD_CLEANUP and SNMALLOC_USE_THREAD_DESTRUCTOR may be defined.
 #endif
 
+#if !defined(_WIN32) && !defined(FreeBSD_KERNEL)
+#  include "pthread.h"
+#endif
+
 namespace snmalloc
 {
   extern "C" void _malloc_thread_cleanup(void);
@@ -153,7 +157,7 @@ namespace snmalloc
 #  endif
       thread_alloc_release(void* p)
     {
-      Alloc** pp = (Alloc**)p;
+      Alloc** pp = static_cast<Alloc**>(p);
       current_alloc_pool()->release(*pp);
       *pp = nullptr;
     }
@@ -215,14 +219,32 @@ namespace snmalloc
       pthread_setspecific(key, static_cast<void*>(value));
     }
 #  endif
-  public:
+
     /**
-     * Public interface, returns the allocator for the current thread,
-     * constructing it if necessary.
+     * Private accessor to the per thread allocator
+     * Provides no checking for initialization
      */
-    static inline Alloc*& get()
+    static ALWAYSINLINE Alloc*& inner_get()
     {
       static thread_local Alloc* per_thread;
+      return per_thread;
+    }
+
+#  ifdef USE_SNMALLOC_STATS
+    static void print_stats()
+    {
+      Stats s;
+      current_alloc_pool()->aggregate_stats(s);
+      s.print<Alloc>(std::cout);
+    }
+#  endif
+
+    /**
+     * Private initialiser for the per thread allocator
+     */
+    static NOINLINE Alloc*& inner_init()
+    {
+      Alloc*& per_thread = inner_get();
 
       // If we don't have an allocator, construct one.
       if (!per_thread)
@@ -235,12 +257,38 @@ namespace snmalloc
         // allocator.
         per_thread = current_alloc_pool()->acquire();
 
-        tls_key_t key = Singleton<tls_key_t, tls_key_create>::get();
+        bool first = false;
+        tls_key_t key = Singleton<tls_key_t, tls_key_create>::get(&first);
         // Associate the new allocator with the destructor.
         tls_set_value(key, &per_thread);
-      }
 
+#  ifdef USE_SNMALLOC_STATS
+        // Allocator is up and running now, safe to call atexit.
+        if (first)
+        {
+          atexit(print_stats);
+        }
+#  else
+        UNUSED(first);
+#  endif
+      }
       return per_thread;
+    }
+
+  public:
+    /**
+     * Public interface, returns the allocator for the current thread,
+     * constructing it if necessary.
+     */
+    static ALWAYSINLINE Alloc*& get()
+    {
+      Alloc*& per_thread = inner_get();
+
+      if (per_thread != nullptr)
+        return per_thread;
+
+      // Slow path that performs initialization
+      return inner_init();
     }
   };
 #endif
@@ -262,4 +310,4 @@ namespace snmalloc
 #else
   using ThreadAlloc = ThreadAllocExplicitTLSCleanup;
 #endif
-}
+} // namespace snmalloc
